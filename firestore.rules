@@ -1,0 +1,106 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reuseable helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(ownerId) {
+      return isSignedIn() && request.auth.uid == ownerId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // User Profile Rules
+    match /users/{uid} {
+      function isValidUser(data) {
+        return data.uid is string && data.uid == uid &&
+               data.email is string && data.email.size() <= 256;
+      }
+
+      allow get: if isOwner(uid);
+      allow create, update: if isOwner(uid) && isValidUser(incoming());
+    }
+
+    // Project Rules
+    match /projects/{projectId} {
+      function isValidProject(data) {
+        return data.id is string && data.id.size() <= 128 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 255 &&
+               data.type in ['web', 'expo'] &&
+               data.ownerId == request.auth.uid;
+      }
+
+      // get is allowed if document doesn't exist (returns 404) or if user is owner
+      allow get: if isSignedIn() && (resource == null || resource.data.ownerId == request.auth.uid);
+      // list requires query filter
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidProject(incoming());
+      allow update: if isSignedIn() && resource.data.ownerId == request.auth.uid && isValidProject(incoming()) &&
+                      incoming().ownerId == resource.data.ownerId &&
+                      incoming().id == resource.data.id;
+      allow delete: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+
+      // Sub-collections use ownerId check recorded in the document
+      match /files/{fileId} {
+        function isValidFile(data) {
+          return data.name is string && data.name.size() <= 255 &&
+                 data.ownerId == request.auth.uid &&
+                 (
+                   (data.get('content', '') is string && data.get('content', '').size() <= 1048576) ||
+                   (data.get('storagePath', '') is string && data.get('storagePath', '').size() <= 1024)
+                 );
+        }
+
+        // Allow read if user is owner of the file OR if they are owner of the parent project
+        allow get: if isSignedIn() && (resource == null || 
+                                       resource.data.get('ownerId', null) == request.auth.uid || 
+                                       get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        
+        // List requires ownerId filter on the query for security and performance
+        allow list: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
+                                        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+
+        allow create, update: if isSignedIn() && isValidFile(incoming());
+        allow delete: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
+                                          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+      }
+
+      match /messages/{messageId} {
+        function isValidMessage(data) {
+          return data.get('role', '') in ['user', 'assistant', 'system'] &&
+                 data.ownerId == request.auth.uid &&
+                 data.get('content', '') is string && data.get('content', '').size() <= 512000;
+        }
+
+        allow get: if isSignedIn() && (resource == null || 
+                                       resource.data.get('ownerId', null) == request.auth.uid || 
+                                       get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        
+        allow list: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
+                                        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        
+        allow create: if isSignedIn() && isValidMessage(incoming());
+        allow update, delete: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
+                                                  get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+      }
+    }
+  }
+}

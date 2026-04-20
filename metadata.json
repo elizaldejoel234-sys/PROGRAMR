@@ -1,0 +1,5 @@
+{
+  "name": "Remix: Aura IDE",
+  "description": "An AI-powered web IDE with integrated chat, file explorer, terminal, and real-time preview.",
+  "requestFramePermissions": []
+}
