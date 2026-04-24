@@ -106,6 +106,7 @@ import { saveProjectMetadata, syncProjectFiles, loadProjectFiles } from './servi
 import FirebaseLogin from './components/FirebaseLogin';
 import { io, Socket } from 'socket.io-client';
 import { QRCodeCanvas } from 'qrcode.react';
+import { ably } from './lib/ably';
 
 const MODELS = [
   { id: 'gemini-3.1-pro-preview', name: 'SUPERPOWER' },
@@ -349,49 +350,96 @@ const INITIAL_FULLSTACK_FILES: FileItem[] = [
     name: 'server.ts',
     language: 'typescript',
     content: `import express from 'express';
+import { helloRoutes } from './server/features/hello/hello.routes';
+
 const app = express();
 const PORT = 3000;
 
 app.use(express.json());
 
-app.get('/api/data', (req, res) => {
-  res.json({ message: "Hello from the Python/Fullstack backend!", items: [1, 2, 3] });
-});
+// Register vertical modular routes
+app.use('/api', helloRoutes);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(\`Server running on http://localhost:\${PORT}\`);
 });`
   },
   {
+    name: 'server/features/hello/hello.routes.ts',
+    language: 'typescript',
+    content: `import { Router } from 'express';
+import { getHelloMessage } from './hello.controller';
+
+export const helloRoutes = Router();
+
+helloRoutes.get('/hello', getHelloMessage);`
+  },
+  {
+    name: 'server/features/hello/hello.controller.ts',
+    language: 'typescript',
+    content: `import { Request, Response } from 'express';
+import { generateGreeting } from './hello.service';
+
+export const getHelloMessage = (req: Request, res: Response) => {
+  const message = generateGreeting();
+  res.json({ message, items: [1, 2, 3] });
+};`
+  },
+  {
+    name: 'server/features/hello/hello.service.ts',
+    language: 'typescript',
+    content: `export const generateGreeting = () => {
+  return "Hello from the Vertical Modular Backend!";
+};`
+  },
+  {
     name: 'src/App.tsx',
     language: 'typescript',
     content: `import React, { useEffect, useState } from 'react';
+import { fetchHelloData } from './features/hello/api/hello.api';
 
 export default function App() {
   const [data, setData] = useState<any>(null);
 
   useEffect(() => {
-    fetch('/api/data')
-      .then(res => res.json())
-      .then(setData);
+    fetchHelloData()
+      .then(setData)
+      .catch(console.error);
   }, []);
 
   return (
-    <div className="p-8">
-      <h1 className="text-2xl font-bold">Fullstack Project</h1>
-      <p className="mt-4">Connectivity to backend API:</p>
-      <pre className="bg-zinc-100 p-4 mt-4 rounded">
-        {JSON.stringify(data, null, 2) || 'Loading...'}
-      </pre>
+    <div className="p-8 max-w-2xl mx-auto">
+      <h1 className="text-3xl font-bold text-indigo-600 mb-2">Vertical Modular Architecture</h1>
+      <p className="text-zinc-600 mb-6">Backend and Frontend are sliced by feature.</p>
+      
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-xl">
+        <h2 className="text-white text-sm uppercase tracking-wider font-semibold mb-4">API Response Status</h2>
+        <pre className="text-green-400 font-mono text-sm overflow-x-auto">
+          {data ? JSON.stringify(data, null, 2) : 'Fetching data from modular API...'}
+        </pre>
+      </div>
     </div>
   );
 }`
   },
   {
+    name: 'src/features/hello/api/hello.api.ts',
+    language: 'typescript',
+    content: `export const fetchHelloData = async () => {
+  try {
+    const res = await fetch('/api/hello');
+    return await res.json();
+  } catch (error) {
+    console.error("Failed to fetch hello data", error);
+    throw error;
+  }
+};`
+  },
+  {
     name: 'package.json',
     language: 'json',
     content: `{
-  "name": "aura-fullstack",
+  "name": "aura-fullstack-modular",
   "scripts": {
     "start": "tsx server.ts",
     "dev": "tsx server.ts"
@@ -776,6 +824,56 @@ export default function App() {
   const [repoDescription, setRepoDescription] = useState('');
   const [showNewRepoForm, setShowNewRepoForm] = useState(false);
   const [isPrivateRepo, setIsPrivateRepo] = useState(false);
+  const isGeneratingLocallyRef = useRef(false);
+  const currentProjectIdRef = useRef<string | null>(null);
+
+  // Update currentProjectIdRef when currentProject changes
+  useEffect(() => {
+    currentProjectIdRef.current = currentProject?.id || null;
+  }, [currentProject]);
+
+  // Ably chat token listener
+  useEffect(() => {
+    if (!currentProject) return;
+    
+    const channel = ably.channels.get(`project-${currentProject.id}-chat`);
+    
+    const onTokenStream = (message: any) => {
+      if (isGeneratingLocallyRef.current) return; // We are producing the stream locally
+      setIsLoading(true);
+      setAgentStatus('typing');
+      setStreamingMessage(message.data.fullText);
+    };
+
+    const onStreamComplete = (message: any) => {
+      if (isGeneratingLocallyRef.current) return;
+      setIsLoading(false);
+      setAgentStatus('idle');
+      // Let's rely on the sync to get the final message or we can append it directly, 
+      // but typically we'll want a full sync of messages.
+    };
+    
+    // Support remote chat events
+    const onNewMessage = (ablyMsg: any) => {
+      if (ablyMsg.data.sender === ably.auth.clientId) return; // Ignore own messages
+      const msg = ablyMsg.data.message;
+      setMessages(prev => {
+        // Prevent duplicates
+        if (prev.find(m => m.content === msg.content && m.role === msg.role)) return prev;
+        return [...prev, msg];
+      });
+    };
+
+    channel.subscribe('token_stream', onTokenStream);
+    channel.subscribe('stream_complete', onStreamComplete);
+    channel.subscribe('new_message', onNewMessage);
+
+    return () => {
+      channel.unsubscribe('token_stream', onTokenStream);
+      channel.unsubscribe('stream_complete', onStreamComplete);
+      channel.unsubscribe('new_message', onNewMessage);
+    };
+  }, [currentProject]);
 
   // Listen for OAuth messages
   useEffect(() => {
@@ -1299,8 +1397,11 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
-  const handleSendMessage = async (autoPrompt?: string, retryCount: number = 0, customMessages?: Message[], isHiddenPrompt?: boolean) => {
+  const handleSendMessage = async (autoPrompt?: string, retryCount: number = 0, customMessages?: Message[], isHiddenPrompt?: boolean, skipVerification?: boolean) => {
     if ((!input.trim() && !selectedImage && !autoPrompt) || (isLoading && !autoPrompt)) return;
+
+    const startingProjectId = currentProject?.id;
+    isGeneratingLocallyRef.current = true;
 
     const lastImage = selectedImage;
     let currentMessages = customMessages || [...messages];
@@ -1314,14 +1415,18 @@ export default function App() {
         theme: isStitchMode ? selectedTheme : undefined
       };
       currentMessages.push(userMessage);
-      setMessages(currentMessages);
+      if (currentProjectIdRef.current === startingProjectId) setMessages(currentMessages);
+      
+      const channel = ably.channels.get(`project-${currentProject?.id || 'default'}-chat`);
+      channel.publish('new_message', { message: userMessage, sender: ably.auth.clientId });
+
       setInput('');
       setSelectedImage(null);
       setVerificationRetryCount(0);
     } else {
       const systemMessage: Message = { role: 'user', content: autoPrompt, isHidden: isHiddenPrompt };
       currentMessages.push(systemMessage);
-      setMessages(currentMessages);
+      if (currentProjectIdRef.current === startingProjectId) setMessages(currentMessages);
     }
 
     setIsLoading(true);
@@ -1356,6 +1461,8 @@ export default function App() {
                     if (!fileChanges.find(fc => fc.file === name)) {
                       fileChanges.push({ type: 'edit', file: name });
                     }
+                    // For edits, replace the entire file content, assuming the LLM provided the full file 
+                    // (which is explicitly instructed in the system prompt now).
                     return prev.map(f => f.name === name ? { ...f, content, language } : f);
                   }
                   if (!fileChanges.find(fc => fc.file === name)) {
@@ -1365,7 +1472,7 @@ export default function App() {
                 });
                 
                 if (activeFile.name === name) {
-                  setActiveFile({ name, content, language });
+                  setActiveFile(prev => ({ ...prev, content, language }));
                 }
               } else if (call.name === 'run_command') {
                 const { command } = call.args as any;
@@ -1434,8 +1541,15 @@ export default function App() {
             setAgentStatus('typing');
             fullText += chunk.text;
             setStreamingMessage(fullText);
+            
+            // Ably token streaming integration
+            const channel = ably.channels.get(`project-${currentProject?.id || 'default'}-chat`);
+            channel.publish('token_stream', { text: chunk.text, fullText });
           }
         }
+
+        const channel = ably.channels.get(`project-${currentProject?.id || 'default'}-chat`);
+        channel.publish('stream_complete', { complete: true });
 
         const modelResponse: Message = { 
           role: 'model', 
@@ -1446,7 +1560,7 @@ export default function App() {
         };
         
         const updatedMessages = [...currentMessages, modelResponse];
-        setMessages(updatedMessages);
+        if (currentProjectIdRef.current === startingProjectId) setMessages(updatedMessages);
 
         // Analyze if the message requires automatic continuation
         const contentText = modelResponse.content.trim();
@@ -1457,25 +1571,20 @@ export default function App() {
         
         let needsContinue = false;
         let continueReason = '';
-        let continuePrompt = "¿Ya acabaste? Si tu respuesta es sí, responde ÚNICAMENTE con la palabra 'COMPLETADO' (en mayúsculas y sin formato). Si tu respuesta es no, continúa editando o ejecutando herramientas para terminar.";
+        let continuePrompt = "¿Ya acabaste? Si tu respuesta es sí, responde ÚNICAMENTE con la palabra 'COMPLETADO' (en mayúsculas y sin formato). Si no, continúa y dime lo que falta.";
 
         if ((isCodeBlockCutOff || isLengthCutOff) && retryCount < 10) {
           needsContinue = true;
           continueReason = 'Detectada respuesta incompleta. Continuando automáticamente...';
           continuePrompt = "Continúa exactamente donde te quedaste, por favor.";
-        } else if (!contentText.includes('COMPLETADO') && (hasFunctionCall || retryCount > 0) && retryCount < 10) {
-          needsContinue = true;
-          continueReason = 'Ejecución parcial. Consultando si la tarea está completa...';
         }
 
         let finalMessages = updatedMessages;
-        let isFinished = false;
+        let isFinished = !needsContinue;
 
+        // Clean up any stray COMPLETADO messages if they snuck in
         if (contentText.includes('COMPLETADO')) {
-           needsContinue = false;
-           isFinished = true;
-           // Delete the COMPLETADO message from the array to keep UI clean
-           setMessages(prev => prev.filter(msg => !msg.content.includes('COMPLETADO')));
+           if (currentProjectIdRef.current === startingProjectId) setMessages(prev => prev.filter(msg => !msg.content.includes('COMPLETADO')));
            finalMessages = updatedMessages.filter(msg => !msg.content.includes('COMPLETADO'));
         }
 
@@ -1483,13 +1592,13 @@ export default function App() {
           isContinuing = true;
           setAgentStatus('thinking');
           setStreamingMessage(continueReason);
-          // Auto continue loop until COMPLETADO
-          setTimeout(() => handleSendMessage(continuePrompt, retryCount + 1, finalMessages, true), 1500);
+          // Auto continue loop. Pass along the current skipVerification state so it doesn't get forgotton in cutoffs
+          setTimeout(() => handleSendMessage(continuePrompt, retryCount + 1, finalMessages, true, skipVerification), 1500);
           return;
         }
 
         // Auto-verification logic runs when finally done (isFinished)
-        if (isFinished) {
+        if (isFinished && !skipVerification) {
           isContinuing = true;
           setAgentStatus('verifying');
           
@@ -1505,17 +1614,17 @@ export default function App() {
               // Errors found!
               setAgentStatus('thinking');
               const errorPrompt = `He detectado errores después de los cambios. Por favor, corrígelos:\n\n\`\`\`\n${data.output}\n\`\`\``;
-              // Reset retry count when fixing errors to give it more attempts
-              setTimeout(() => handleSendMessage(errorPrompt, 0, finalMessages, true), 3000);
+              // Reset retry count when fixing errors to give it more attempts. We WANT to verify after fixing.
+              setTimeout(() => handleSendMessage(errorPrompt, 0, finalMessages, true, false), 3000);
               return; 
             } else {
               // Success! No errors. We request the final summary.
               setAgentStatus('thinking');
               setStreamingMessage('Generando resumen final para el usuario...');
-              const summaryPrompt = "Dile al usuario la edición que hiciste de forma clara y amigable. Resume los problemas solucionados o los archivos creados/editados. IMPORTANTE: NO uses la palabra 'COMPLETADO' de nuevo.";
-              // We pass 10 as retryCount or a special flag so it doesn't trigger the loop again, 
-              // but since hasFunctionCall will be false on a normal text reply, it won't loop.
-              setTimeout(() => handleSendMessage(summaryPrompt, 0, finalMessages, true), 1500);
+              const summaryPrompt = "Dile al usuario la edición que hiciste de forma clara y amigable. Resume los problemas solucionados o los archivos creados/editados.";
+              
+              // Call summary. Here we set skipVerification to true so it stops instead of triggering this block again!
+              setTimeout(() => handleSendMessage(summaryPrompt, 0, finalMessages, true, true), 1500);
               return;
             }
           } catch (e) {
@@ -1536,9 +1645,10 @@ export default function App() {
           errorMessage = "🚫 Acceso denegado (403). Es posible que la clave de API empleada no tenga permisos para usar este modelo en concreto (algunos modelos experimentales requieren acceso anticipado) o tu región no esté soportada. Intenta seleccionar un modelo diferente (como Economy/Flash).";
         }
 
-        setMessages(prev => [...prev, { role: 'system', content: `Error al comunicar con Aura: ${errorMessage}` }]);
+        if (currentProjectIdRef.current === startingProjectId) setMessages(prev => [...prev, { role: 'system', content: `Error al comunicar con Aura: ${errorMessage}` }]);
       } finally {
         if (!isContinuing) {
+          isGeneratingLocallyRef.current = false;
           setIsLoading(false);
           setAgentStatus('idle');
           setStreamingMessage('');
@@ -1676,6 +1786,195 @@ export default function App() {
     return html;
   };
 
+  const getReactWebHtml = () => {
+    const totalSize = files.reduce((acc, f) => acc + (f.content?.length || 0), 0);
+    if (totalSize > 2 * 1024 * 1024) {
+      return `
+        <div style="padding: 40px; font-family: sans-serif; text-align: center; color: #333;">
+          <h2 style="color: #ef4444;">⚠️ Proyecto demasiado grande</h2>
+          <p>La previsualización local integrada tiene un límite de 2MB.</p>
+        </div>
+      `;
+    }
+
+    let filesJson = '[]';
+    try { filesJson = JSON.stringify(files).replace(/</g, '\\u003c'); } catch (e) {
+      return `<div style="padding: 20px; color: red;">Error: No se pudo procesar.</div>`;
+    }
+    
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>React Preview</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+          html, body, #root { height: 100%; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+          .error-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.95); color: #ff5555; padding: 30px; font-family: monospace; z-index: 9999; overflow: auto; }
+          .loading-overlay { position: fixed; inset: 0; background: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1000; transition: opacity 0.5s; }
+          .spinner { width: 40px; height: 40px; border: 3px solid #f3f3f3; border-top: 3px solid #3b82f6; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 15px; }
+          @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+          .status-text { color: #64748b; font-size: 13px; font-weight: 500; }
+        </style>
+        <script>
+          window.onerror = function(msg, url, lineNo, columnNo, error) {
+            showError(error || msg, 'Runtime');
+            return false;
+          };
+          window.addEventListener('unhandledrejection', function(event) {
+            showError(event.reason, 'Async/Promise');
+          });
+          function showError(err, filename) {
+            const loading = document.querySelector('.loading-overlay');
+            if (loading) loading.style.display = 'none';
+            const overlay = document.createElement('div');
+            overlay.className = 'error-overlay';
+            overlay.innerHTML = '<h3>Error in ' + filename + '</h3><pre>' + (err.message || String(err)) + '\\n\\n' + (err.stack || '') + '</pre>';
+            document.body.appendChild(overlay);
+          }
+          function updateStatus(text) {
+            const status = document.querySelector('.status-text');
+            if (status) status.textContent = text;
+          }
+        </script>
+      </head>
+      <body>
+        <div id="root"></div>
+        <div class="loading-overlay">
+          <div class="spinner"></div>
+          <div class="status-text">Iniciando React Preview...</div>
+        </div>
+        <script type="module">
+          updateStatus('Cargando dependencias React...');
+          import * as React from 'https://esm.sh/react@18.2.0';
+          import * as ReactDOM from 'https://esm.sh/react-dom@18.2.0';
+          import * as ReactDOMClient from 'https://esm.sh/react-dom@18.2.0/client';
+          import * as lucide from 'https://esm.sh/lucide-react';
+          
+          window.React = React;
+          window.ReactDOM = ReactDOM;
+          window.ReactDOMClient = ReactDOMClient;
+          window.lucide = lucide;
+          
+          const API_HOST = '${window.location.origin}';
+          window._interopRequireDefault = function(obj) { return obj && obj.__esModule ? obj : { default: obj }; };
+          window.process = { env: { NODE_ENV: 'development' } };
+          
+          const files = ${filesJson};
+          updateStatus('Transpilando archivos (Babel Server)...');
+          
+          for (const file of files) {
+            if (file.language === 'javascript' || file.language === 'typescript' || file.name.endsWith('.js') || file.name.endsWith('.tsx') || file.name.endsWith('.ts')) {
+              try {
+                const res = await fetch(API_HOST + '/api/transpile', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ code: file.content, filename: file.name, projectType: "react" })
+                });
+                const data = await res.json();
+                if (data.success) {
+                  file.transpiled = data.code;
+                } else {
+                  console.error('Transpile failed:', data.error);
+                }
+              } catch (e) {
+                console.error('Failed to transpile', e);
+              }
+            } else if (file.name.endsWith('.css')) {
+               const style = document.createElement('style');
+               style.innerHTML = file.content;
+               document.head.appendChild(style);
+            }
+          }
+
+          const modules = {};
+          async function customRequire(name) {
+            if (name === 'react') return window.React;
+            if (name === 'react-dom') return window.ReactDOM;
+            if (name === 'react-dom/client') return window.ReactDOMClient;
+            if (name === 'lucide-react') return window.lucide;
+            if (name.endsWith('.css')) return {}; 
+
+            let baseName = name.replace(/^\\.\\//, '').replace(/\\.jsx?$/, '').replace(/\\.tsx?$/, '');
+            const extensions = ['.tsx', '.ts', '.jsx', '.js'];
+            let file;
+
+            for (const ext of extensions) {
+              const testName = baseName + ext;
+              file = files.find(f => f.name === testName || f.name === './' + testName);
+              if (file) break;
+            }
+
+            if (!file) file = files.find(f => f.name.replace(/\\.[jt]sx?$/, '') === baseName);
+            if (!file) {
+              const parts = baseName.split('/');
+              file = files.find(f => f.name.split('/').pop().replace(/\\.[jt]sx?$/, '') === parts[parts.length - 1]);
+            }
+            
+            if (file) {
+              if (modules[file.name]) return modules[file.name].exports;
+              const module = { exports: {} };
+              modules[file.name] = module;
+              try {
+                updateStatus('Ejecutando ' + file.name + '...');
+                const codeToRun = file.transpiled || file.content;
+                const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+                const fn = new AsyncFunction('require', 'module', 'exports', 'React', codeToRun);
+                await fn(customRequire, module, module.exports, window.React);
+                return module.exports;
+              } catch (err) {
+                showError(err, file.name);
+                throw err;
+              }
+            }
+
+            if (!name.startsWith('.') && !name.startsWith('/') && !modules[name]) {
+              try {
+                updateStatus('Buscando librería externa: ' + name + '...');
+                return await import('https://esm.sh/' + name);
+              } catch (e) {
+                console.warn('Library ' + name + ' not found');
+              }
+            }
+            throw new Error('Módulo no encontrado: ' + name);
+          }
+
+          try {
+            updateStatus('Iniciando Aplicación React...');
+            let entryFile = files.find(f => f.name === 'main.tsx' || f.name === 'src/main.tsx' || f.name === 'main.js' || f.name === 'index.js' || f.name === 'src/index.js' || f.name === 'index.tsx' || f.name === 'src/index.tsx');
+            
+            if (!entryFile) {
+               let appFile = files.find(f => f.name === 'App.tsx' || f.name === 'src/App.tsx' || f.name === 'App.js' || f.name === 'src/App.js');
+               if (appFile) {
+                  const App = await customRequire(appFile.name);
+                  const root = window.ReactDOMClient.createRoot(document.getElementById('root'));
+                  root.render(React.createElement(App.default || App));
+               } else {
+                  document.getElementById('root').innerHTML = '<div style="padding: 20px; color: #666; font-family: sans-serif; text-align: center;"><h3>Error de Inicio</h3><p>No se encontró main.tsx o App.tsx</p></div>';
+                  document.querySelector('.loading-overlay').style.display = 'none';
+               }
+            } else {
+              await customRequire(entryFile.name);
+            }
+            
+            setTimeout(() => {
+              const loading = document.querySelector('.loading-overlay');
+              if (loading) {
+                 loading.style.opacity = '0';
+                 setTimeout(() => loading.style.display = 'none', 500);
+              }
+            }, 100);
+          } catch (err) {
+            showError(err, 'Bootstrap');
+          }
+        </script>
+      </body>
+      </html>
+    `;
+  };
+
   const getReactNativeWebHtml = () => {
     // Safety check for massive projects
     const totalSize = files.reduce((acc, f) => acc + (f.content?.length || 0), 0);
@@ -1801,7 +2100,7 @@ export default function App() {
                 const res = await fetch(API_HOST + '/api/transpile', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ code: file.content, filename: file.name })
+                  body: JSON.stringify({ code: file.content, filename: file.name, projectType: "expo" })
                 });
                 const data = await res.json();
                 if (data.success) {
@@ -1959,8 +2258,8 @@ export default function App() {
 
           try {
             updateStatus('Iniciando Aplicación...');
-            let entryFile = files.find(f => f.name === 'index.js' || f.name === 'index.ts' || f.name === 'AppEntry.js');
-            if (!entryFile) entryFile = files.find(f => f.name === 'App.js' || f.name === 'App.tsx');
+            let entryFile = files.find(f => f.name === 'index.js' || f.name === 'src/index.js' || f.name === 'index.ts' || f.name === 'src/index.ts' || f.name === 'AppEntry.js');
+            if (!entryFile) entryFile = files.find(f => f.name === 'App.js' || f.name === 'src/App.js' || f.name === 'App.tsx' || f.name === 'src/App.tsx');
 
             if (!entryFile) {
               document.getElementById('root').innerHTML = '<div style="padding: 20px; color: #666; font-family: sans-serif; text-align: center;"><h3>Error de Inicio</h3><p>No se encontró punto de entrada (index.js o App.js)</p></div>';
@@ -1995,6 +2294,13 @@ export default function App() {
   const openInNewTab = (isExpoGo: boolean = false) => {
     if (projectType === 'expo') {
       const html = isExpoGo ? getSnackPostHtml(false) : getReactNativeWebHtml();
+      const blob = new Blob([html], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      return;
+    }
+    if (projectType === 'react' || projectType === 'fullstack') {
+      const html = getReactWebHtml();
       const blob = new Blob([html], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
       window.open(url, '_blank');
@@ -2140,7 +2446,7 @@ export default function App() {
             >
               <SidebarIcon className="w-5 h-5" />
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setView('dashboard')} className="gap-2 text-zinc-600 hover:text-zinc-900">
+            <Button variant="ghost" size="sm" onClick={() => { setView('dashboard'); setCurrentProject(null); setMessages([]); }} className="gap-2 text-zinc-600 hover:text-zinc-900">
               <ArrowLeft className="w-4 h-4" />
               <span className="hidden sm:inline">Dashboard</span>
             </Button>
@@ -2937,6 +3243,15 @@ export default function App() {
                           sandbox="allow-modals allow-forms allow-popups allow-scripts allow-same-origin"
                         />
                       )
+                    ) : projectType === 'react' || projectType === 'fullstack' ? (
+                      <iframe 
+                        key={previewKey}
+                        title="Aura React Preview"
+                        className="w-full h-full border-none"
+                        srcDoc={getReactWebHtml()}
+                        allow="geolocation; microphone; camera; midi; vr; accelerometer; gyroscope; payment; ambient-light-sensor; encrypted-media; usb"
+                        sandbox="allow-modals allow-forms allow-popups allow-scripts allow-same-origin"
+                      />
                     ) : (
                       <iframe 
                         key={previewKey}

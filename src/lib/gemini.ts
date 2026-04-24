@@ -34,6 +34,8 @@ Always provide the FULL content of the file when using 'write_file'.
 
 CRITICAL INSTRUCTION: When a user asks you to build or modify something, you MUST complete the ENTIRE task in one go. Do NOT stop halfway. Do NOT ask "Should I continue?" or "Would you like me to do the next part?". Use the 'write_file' tool as many times as necessary to finish the complete request before you finish your response.
 
+FILE EDITING RULE: If you are asked to "improve", "modify", or "fix" an existing file, you MUST write the ENTIRE file content using 'write_file'. Our system does not support partial diffs. You must rewrite the whole file with your changes included. Never output just a snippet. Respect existing code, and preserve user progress and previous designs.
+
 DESIGN PHILOSOPHY:
 - Craftsmanship over Defaults: Never use generic purple/blue gradients or default shadows.
 - Intentional Variation: Create rhythm through variation in padding, margins, and font usage.
@@ -74,15 +76,22 @@ If the user provides an image and asks to set it as the app icon:
 Current project context: A modern React application using Vite and TypeScript.
 You should use React components (Functional components with hooks). 
 Tailwind CSS is used for styling.
+
+ARCHITECTURAL REQUIREMENT: Use a "Vertical Modular Architecture" (Feature-based grouping).
+Group your UI logic by feature/domain rather than grouping globally by component type. 
+Example structure: '/src/features/authentication/components/Login.tsx', '/src/features/authentication/hooks/useAuth.ts'.
 The main entry point is 'src/main.tsx' and the root component is 'src/App.tsx'.`;
   }
 
   if (projectType === 'fullstack') {
     return `${basePrompt}
 Current project context: A full-stack application with an Express server and a React frontend.
-The server entry point is 'server.ts'. 
-The frontend is in 'src/' and entry point is 'src/main.tsx'.
-You can add API routes in 'server.ts' and call them from the React app.`;
+
+ARCHITECTURAL REQUIREMENT: You MUST use a "Vertical Modular Architecture" (Feature-Sliced Design).
+Backend: Group your backend code into domains (e.g., '/server/features/users/user.routes.ts', 'user.controller.ts', 'user.service.ts'). The 'server.ts' file must remain clean and just import routes.
+Frontend: Group UI logic by feature domain (e.g., '/src/features/users/components/UserList.tsx', '/src/features/users/api/userApi.ts').
+
+The server entry point is 'server.ts'. The frontend entry point is 'src/main.tsx'.`;
   }
 
   return `${basePrompt}
@@ -93,7 +102,7 @@ The main entry point is 'index.html'.`;
 
 export const write_file_tool = {
   name: "write_file",
-  description: "Create or update a file in the virtual file system.",
+  description: "Create or update a file in the virtual file system. ALWAYS provide the complete file content. DO NOT provide partial code blocks or just the changes.",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -103,7 +112,7 @@ export const write_file_tool = {
       },
       content: {
         type: Type.STRING,
-        description: "The full content of the file.",
+        description: "The COMPLETE, EXACT content of the file. No placeholders or skipped code.",
       },
       language: {
         type: Type.STRING,

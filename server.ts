@@ -72,11 +72,37 @@ async function startServer() {
       const { code, filename } = req.body;
       if (!code) return res.status(400).json({ error: 'Missing code' });
 
+      let actualFilename = filename || 'file.tsx';
+      const tmpDir = path.join(process.cwd(), '.tmp-transpile');
+      if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+      actualFilename = path.join(tmpDir, actualFilename.replace(/\//g, '_'));
+      fs.writeFileSync(actualFilename, code);
+
+      const isReactWeb = req.body.projectType === 'react' || req.body.projectType === 'fullstack';
+      
+      const presets = isReactWeb ? [
+        ['@babel/preset-env', { modules: 'commonjs' }],
+        ['@babel/preset-react', { runtime: 'classic' }],
+        '@babel/preset-typescript'
+      ] : [
+        'babel-preset-expo'
+      ];
+
+      const plugins = isReactWeb ? [] : [
+        'react-native-reanimated/plugin'
+      ];
+
       const result = await babel.transformAsync(code, {
-        filename: filename || 'file.tsx',
-        presets: ['module:metro-react-native-babel-preset'],
-        caller: { name: 'aura-studio' }
+        filename: actualFilename,
+        presets,
+        plugins,
+        caller: { name: 'aura-studio' },
+        configFile: false,
+        babelrc: false
       });
+
+      // Cleanup
+      if (fs.existsSync(actualFilename)) fs.unlinkSync(actualFilename);
 
       res.json({ success: true, code: result?.code });
     } catch (e: any) {
