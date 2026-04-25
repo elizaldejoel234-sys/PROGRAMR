@@ -172,7 +172,7 @@ const formatMessagesForGemini = (messages: any[]) => {
   return messages.map(msg => {
     const parts: any[] = [{ text: msg.content }];
     
-    if (msg.image) {
+    if (msg.image && msg.image.data) {
       parts.push({
         inlineData: {
           data: msg.image.data,
@@ -225,7 +225,6 @@ export async function chatWithAuraStream(messages: any[], files: FileItem[], mod
     config: {
       systemInstruction: systemPrompt,
       tools: [
-        { googleSearch: {} },
         { functionDeclarations: [write_file_tool, read_url_tool, run_command_tool, save_uploaded_image_tool] }
       ],
       toolConfig: { includeServerSideToolInvocations: true },
@@ -263,7 +262,6 @@ export async function chatWithAura(messages: any[], files: FileItem[], model: st
     config: {
       systemInstruction: systemPrompt,
       tools: [
-        { googleSearch: {} },
         { functionDeclarations: [write_file_tool, read_url_tool, run_command_tool, save_uploaded_image_tool] }
       ],
       toolConfig: { includeServerSideToolInvocations: true },

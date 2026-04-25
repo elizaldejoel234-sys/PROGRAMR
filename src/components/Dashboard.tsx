@@ -7,20 +7,25 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 
 interface DashboardProps {
   projects: Project[];
-  onCreateProject: (name: string, type: Project['type']) => void;
+  onCreateProject: (name: string, type: Project['type'], githubPrivate?: boolean) => void;
   onLoadProject: (project: Project) => void;
+  onImportFromGithub: () => void;
+  githubUser: any;
 }
 
-export default function Dashboard({ projects, onCreateProject, onLoadProject }: DashboardProps) {
+export default function Dashboard({ projects, onCreateProject, onLoadProject, onImportFromGithub, githubUser }: DashboardProps) {
   const [isCreating, setIsCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [newType, setNewType] = useState<Project['type']>('react');
+  const [createGithubMode, setCreateGithubMode] = useState(false);
+  const [isPrivateRepo, setIsPrivateRepo] = useState(false);
 
   const handleCreate = () => {
     if (!newName.trim()) return;
-    onCreateProject(newName, newType);
+    onCreateProject(newName, newType, createGithubMode ? isPrivateRepo : undefined);
     setIsCreating(false);
     setNewName('');
+    setCreateGithubMode(false);
   };
 
   return (
@@ -35,46 +40,69 @@ export default function Dashboard({ projects, onCreateProject, onLoadProject }: 
       </header>
 
       <main className="flex-1 max-w-6xl w-full mx-auto p-8">
-        <div className="flex items-center justify-between mb-8">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-8 gap-4">
           <div>
             <h2 className="text-2xl font-bold text-zinc-900">Recent Projects</h2>
             <p className="text-zinc-500 mt-1">Continue working on your previous projects or start a new one.</p>
           </div>
-          <Button onClick={() => setIsCreating(true)} className="gap-2">
-            <Plus className="w-4 h-4" />
-            New Project
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={onImportFromGithub} className="gap-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50">
+              <Globe className="w-4 h-4" />
+              Import from GitHub
+            </Button>
+            <Button onClick={() => setIsCreating(true)} className="gap-2 bg-indigo-600 hover:bg-indigo-700">
+              <Plus className="w-4 h-4" />
+              New Project
+            </Button>
+          </div>
         </div>
 
         {isCreating && (
-          <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-sm mb-8 flex flex-col sm:flex-row gap-4 items-end">
-            <div className="flex-1 w-full">
-              <label className="block text-sm font-medium text-zinc-700 mb-1">Project Name</label>
-              <Input 
-                value={newName} 
-                onChange={(e) => setNewName(e.target.value)} 
-                placeholder="e.g., My Awesome App" 
-                autoFocus
-              />
+          <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-sm mb-8 flex flex-col gap-4">
+            <div className="flex flex-col sm:flex-row gap-4 items-end">
+              <div className="flex-1 w-full">
+                <label className="block text-sm font-medium text-zinc-700 mb-1">Project Name</label>
+                <Input 
+                  value={newName} 
+                  onChange={(e) => setNewName(e.target.value)} 
+                  placeholder="e.g., My Awesome App" 
+                  autoFocus
+                />
+              </div>
+              <div className="w-full sm:w-48">
+                <label className="block text-sm font-medium text-zinc-700 mb-1">Project Type</label>
+                <Select value={newType} onValueChange={(v: any) => setNewType(v)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="react">React / Vite (Moderno)</SelectItem>
+                    <SelectItem value="basic">HTML / CSS / JS (Básico)</SelectItem>
+                    <SelectItem value="fullstack">Fullstack (Next.js / DB)</SelectItem>
+                    <SelectItem value="expo">Mobile App (Expo)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex gap-2 w-full sm:w-auto">
+                <Button variant="outline" onClick={() => setIsCreating(false)}>Cancel</Button>
+                <Button onClick={handleCreate}>Create</Button>
+              </div>
             </div>
-            <div className="w-full sm:w-48">
-              <label className="block text-sm font-medium text-zinc-700 mb-1">Project Type</label>
-              <Select value={newType} onValueChange={(v: any) => setNewType(v)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="react">React / Vite (Moderno)</SelectItem>
-                  <SelectItem value="basic">HTML / CSS / JS (Básico)</SelectItem>
-                  <SelectItem value="fullstack">Fullstack (Next.js / DB)</SelectItem>
-                  <SelectItem value="expo">Mobile App (Expo)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex gap-2 w-full sm:w-auto">
-              <Button variant="outline" onClick={() => setIsCreating(false)}>Cancel</Button>
-              <Button onClick={handleCreate}>Create</Button>
-            </div>
+            
+            {githubUser && (
+              <div className="pt-2 border-t border-zinc-100 flex items-center gap-4">
+                <label className="flex items-center gap-2 cursor-pointer text-sm font-medium text-zinc-700">
+                  <input type="checkbox" checked={createGithubMode} onChange={e => setCreateGithubMode(e.target.checked)} className="rounded border-zinc-300 text-indigo-600 focus:ring-indigo-500" />
+                  Crear repositorio en GitHub al mismo tiempo
+                </label>
+                {createGithubMode && (
+                  <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-600">
+                    <input type="checkbox" checked={isPrivateRepo} onChange={e => setIsPrivateRepo(e.target.checked)} className="rounded border-zinc-300 text-indigo-600 focus:ring-indigo-500" />
+                    Repositorio Privado
+                  </label>
+                )}
+              </div>
+            )}
           </div>
         )}
 

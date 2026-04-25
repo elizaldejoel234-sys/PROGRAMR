@@ -13,6 +13,9 @@ export interface FileChange {
 export interface Message {
   role: 'user' | 'model' | 'system';
   content: string;
+  index?: number;
+  createdAt?: number;
+  ownerId?: string;
   image?: {
     data: string;
     mimeType: string;

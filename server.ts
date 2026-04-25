@@ -496,6 +496,13 @@ async function startServer() {
       child.stderr.on('data', (data) => { output += data.toString(); });
 
       let responded = false;
+      
+      child.on('error', (err) => {
+        if (!responded) {
+          responded = true;
+          res.json({ success: false, output: output + '\\n[Error]: ' + err.message, code: -1 });
+        }
+      });
 
       const timeoutId = setTimeout(() => {
         if (responded) return;
@@ -545,7 +552,13 @@ async function startServer() {
     if (!clientId) {
       return res.status(500).json({ error: "GITHUB_CLIENT_ID not configured" });
     }
-    const redirectUri = `${process.env.APP_URL}/auth/github/callback`;
+    
+    // Get base URL from environment or request
+    const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+    const redirectUri = `${baseUrl.replace(/\/$/, '')}/auth/github/callback`;
+    
+    console.log('Generating GitHub Auth URL with redirect:', redirectUri);
+    
     const url = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=repo,user`;
     res.json({ url });
   });
@@ -554,7 +567,19 @@ async function startServer() {
     const { code } = req.query;
     if (!code) return res.status(400).send("No code provided");
 
+    console.log('Received GitHub OAuth code, exchanging for token...');
+
     try {
+      const clientId = process.env.GITHUB_CLIENT_ID;
+      const clientSecret = process.env.GITHUB_CLIENT_SECRET;
+      
+      if (!clientId || !clientSecret) {
+        throw new Error("GITHUB_CLIENT_ID or GITHUB_CLIENT_SECRET not configured in secrets.");
+      }
+
+      const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+      const redirectUri = `${baseUrl.replace(/\/$/, '')}/auth/github/callback`;
+
       const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
         method: "POST",
         headers: {
@@ -562,24 +587,51 @@ async function startServer() {
           "Accept": "application/json"
         },
         body: JSON.stringify({
-          client_id: process.env.GITHUB_CLIENT_ID,
-          client_secret: process.env.GITHUB_CLIENT_SECRET,
-          code
+          client_id: clientId,
+          client_secret: clientSecret,
+          code,
+          redirect_uri: redirectUri
         })
       });
 
-      const tokenData: any = await tokenResponse.json();
+      const responseText = await tokenResponse.text();
+      let tokenData: any;
+      try {
+        tokenData = JSON.parse(responseText);
+      } catch (e) {
+        console.error('Failed to parse GitHub response as JSON. Body:', responseText);
+        throw new Error(`GitHub returned non-JSON response: ${responseText.substring(0, 100)}...`);
+      }
+
       if (tokenData.error) {
-        return res.status(400).send(`Error: ${tokenData.error_description || tokenData.error}`);
+        console.error('GitHub Token Exchange Error:', tokenData.error_description || tokenData.error);
+        return res.status(400).send(`Error de GitHub: ${tokenData.error_description || tokenData.error}`);
       }
 
       const token = tokenData.access_token;
       
       // Get user info to show in popup
-      const userResponse = await fetch("https://github.com/user", {
-        headers: { Authorization: `token ${token}` }
+      const userResponse = await fetch("https://api.github.com/user", {
+        headers: { 
+          Authorization: `token ${token}`,
+          "User-Agent": "Aura-Studio",
+          "Accept": "application/json"
+        }
       });
-      const userData: any = await userResponse.json();
+      
+      const userText = await userResponse.text();
+      let userData: any;
+      try {
+        userData = JSON.parse(userText);
+      } catch (e) {
+        console.error('Failed to parse GitHub user response as JSON. Body:', userText);
+        throw new Error(`GitHub user API returned non-JSON response: ${userText.substring(0, 100)}...`);
+      }
+
+      if (!userResponse.ok) {
+        console.error('GitHub User API Error:', userData.message || userText);
+        throw new Error(`GitHub User API returned ${userResponse.status}: ${userData.message || 'Unknown error'}`);
+      }
 
       res.send(`
         <html>
@@ -617,6 +669,38 @@ async function startServer() {
       const repos = await response.json();
       res.json(repos);
     } catch (e) {
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  app.post("/api/github/create-repo", async (req, res) => {
+    const token = req.headers.authorization?.replace("token ", "");
+    const { name, description, private: isPrivate } = req.body;
+    
+    if (!token || !name) return res.status(400).json({ error: "Missing parameters" });
+
+    try {
+      const response = await fetch("https://api.github.com/user/repos", {
+        method: "POST",
+        headers: { 
+          Authorization: `token ${token}`,
+          Accept: "application/vnd.github.v3+json",
+          "User-Agent": "Aura-Studio"
+        },
+        body: JSON.stringify({
+          name,
+          description: description || "Created with Aura Studio",
+          private: isPrivate !== false, // default to private
+          auto_init: true // create an initial commit with a README
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        return res.status(response.status).json({ error: data.message || "Failed to create repo" });
+      }
+      res.json(data);
+    } catch (e) {
+      console.error('Create Repo error:', e);
       res.status(500).json({ error: String(e) });
     }
   });
@@ -694,6 +778,81 @@ async function startServer() {
     }
   });
 
+  app.post("/api/github/import", async (req, res) => {
+    const token = req.headers.authorization?.replace("token ", "");
+    const { repoFullName } = req.body;
+    if (!token || !repoFullName) return res.status(400).json({ error: "Missing parameters" });
+
+    try {
+      const { default: JSZip } = await import('jszip');
+      
+      const headers = {
+        Authorization: `token ${token}`,
+        "User-Agent": "Aura-Studio"
+      };
+
+      // 1. Get default branch
+      const repoInfoResponse = await fetch(`https://api.github.com/repos/${repoFullName}`, { headers });
+      const repoInfo: any = await repoInfoResponse.json();
+      const branch = repoInfo.default_branch || 'main';
+
+      // 2. Fetch zipball
+      const zipResponse = await fetch(`https://api.github.com/repos/${repoFullName}/zipball/${branch}`, { headers });
+      if (!zipResponse.ok) throw new Error(`Github API returned ${zipResponse.status}`);
+      
+      const arrayBuffer = await zipResponse.arrayBuffer();
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      
+      // 3. Create project
+      const id = Date.now().toString() + Math.random().toString(36).substring(7);
+      const projectDir = path.join(PROJECTS_DIR, id);
+      fs.mkdirSync(projectDir, { recursive: true });
+
+      const meta = { 
+        id, 
+        name: repoFullName.split('/')[1], 
+        type: 'web', // Default to web, can be adjusted later
+        updatedAt: Date.now(),
+        githubRepo: repoFullName
+      };
+      
+      // Save files from zip
+      const entries = Object.keys(zip.files);
+      if (entries.length === 0) throw new Error("Empty zipball");
+
+      // The zipball has a root directory like owner-repo-sha/
+      const rootDir = entries[0].split('/')[0] + '/';
+
+      for (const entryPath of entries) {
+        const file = zip.files[entryPath];
+        if (file.dir) continue;
+
+        // Skip root dir prefix
+        const relativePath = entryPath.startsWith(rootDir) ? entryPath.substring(rootDir.length) : entryPath;
+        if (!relativePath) continue;
+
+        const content = await file.async("nodebuffer");
+        const fullPath = path.join(projectDir, relativePath);
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fullPath, content);
+      }
+
+      // Check if it looks like an Expo project
+      if (fs.existsSync(path.join(projectDir, 'app.json')) || fs.existsSync(path.join(projectDir, 'expo'))) {
+        meta.type = 'expo';
+      } else if (fs.existsSync(path.join(projectDir, 'server.ts')) || fs.existsSync(path.join(projectDir, 'server.js'))) {
+        meta.type = 'fullstack';
+      }
+
+      fs.writeFileSync(path.join(projectDir, 'meta.json'), JSON.stringify(meta));
+      res.json({ success: true, project: meta });
+    } catch (e) {
+      console.error('GitHub Import Error:', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
   app.post("/api/github/create-repo", async (req, res) => {
     const token = req.headers.authorization?.replace("token ", "");
     const { name, description, private: isPrivate } = req.body;
@@ -720,7 +879,11 @@ async function startServer() {
   // Socket.IO Server for Terminal
   const io = new SocketIOServer(server, {
     path: '/terminal-socket',
-    cors: { origin: '*' }
+    cors: { origin: '*' },
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    allowEIO3: true,
+    transports: ['websocket', 'polling']
   });
 
   io.on('connection', (socket) => {
@@ -732,7 +895,7 @@ async function startServer() {
     if (projectId && !fs.existsSync(cwd)) fs.mkdirSync(cwd, { recursive: true });
     
     const shell = 'script';
-    const args = ['-q', '-c', 'bash -c "stty rows 24 cols 80; exec bash"', '/dev/null'];
+    const args = ['-q', '-e', '-c', 'bash -i', '/dev/null'];
     
     // Add node_modules/.bin to PATH so 'eas' command works
     const envPath = `${path.join(process.cwd(), 'node_modules', '.bin')}:${process.env.PATH}`;

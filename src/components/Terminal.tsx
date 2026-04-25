@@ -76,21 +76,23 @@ export default function Terminal({ projectId }: Props) {
     // Connect Socket.IO
     const socket = io(window.location.origin, {
       path: '/terminal-socket',
-      transports: ['websocket', 'polling'],
+      transports: ['polling', 'websocket'], // Prefer polling for faster initial connection in some proxies
       query: projectId ? { projectId } : undefined,
       reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000
+      reconnectionAttempts: 10,
+      reconnectionDelay: 2000,
+      timeout: 20000
     });
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      term.writeln('Connected to terminal...');
+      term.writeln('\x1b[32mCONNECTED\x1b[0m to terminal server.');
     });
 
     socket.on('connect_error', (error) => {
-      console.error('Socket.IO error:', error);
-      term.writeln('\r\n\x1b[31mTerminal connection error. Check console for details.\x1b[0m');
+      console.error('Terminal Socket.IO error:', error);
+      // Don't clear terminal, just show error
+      term.write(`\r\n\x1b[31mCONNECTION ERROR:\x1b[0m ${error.message}. Retrying...\r\n`);
     });
 
     socket.on('data', (data) => {

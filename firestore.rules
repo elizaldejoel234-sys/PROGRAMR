@@ -43,8 +43,8 @@ service cloud.firestore {
     match /projects/{projectId} {
       function isValidProject(data) {
         return data.id is string && data.id.size() <= 128 &&
-               data.name is string && data.name.size() > 0 && data.name.size() <= 255 &&
-               data.type in ['web', 'expo'] &&
+               data.get('name', ' ') is string && data.get('name', ' ').size() > 0 && data.get('name', ' ').size() <= 255 &&
+               data.get('type', 'web') in ['react', 'expo', 'basic', 'fullstack', 'web'] &&
                data.ownerId == request.auth.uid;
       }
 
@@ -69,37 +69,23 @@ service cloud.firestore {
                  );
         }
 
-        // Allow read if user is owner of the file OR if they are owner of the parent project
-        allow get: if isSignedIn() && (resource == null || 
-                                       resource.data.get('ownerId', null) == request.auth.uid || 
-                                       get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
-        
-        // List requires ownerId filter on the query for security and performance
-        allow list: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
-                                        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
-
+        allow get: if isSignedIn() && (resource == null || resource.data.ownerId == request.auth.uid);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
         allow create, update: if isSignedIn() && isValidFile(incoming());
-        allow delete: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
-                                          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        allow delete: if isSignedIn() && resource.data.ownerId == request.auth.uid;
       }
 
       match /messages/{messageId} {
         function isValidMessage(data) {
-          return data.get('role', '') in ['user', 'assistant', 'system'] &&
+          return data.get('role', '') in ['user', 'assistant', 'system', 'model'] &&
                  data.ownerId == request.auth.uid &&
                  data.get('content', '') is string && data.get('content', '').size() <= 512000;
         }
 
-        allow get: if isSignedIn() && (resource == null || 
-                                       resource.data.get('ownerId', null) == request.auth.uid || 
-                                       get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
-        
-        allow list: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
-                                        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
-        
-        allow create: if isSignedIn() && isValidMessage(incoming());
-        allow update, delete: if isSignedIn() && (resource.data.get('ownerId', null) == request.auth.uid || 
-                                                  get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid);
+        allow get: if isSignedIn() && (resource == null || resource.data.ownerId == request.auth.uid);
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create, update: if isSignedIn() && isValidMessage(incoming());
+        allow delete: if isSignedIn() && resource.data.ownerId == request.auth.uid;
       }
     }
   }

@@ -102,7 +102,7 @@ import remarkGfm from 'remark-gfm';
 
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, db } from './lib/firebase';
-import { saveProjectMetadata, syncProjectFiles, loadProjectFiles } from './services/firebaseService';
+import { saveProjectMetadata, syncProjectFiles, loadProjectFiles, getProjectsFromFirebase, syncProjectMessages, loadProjectMessages } from './services/firebaseService';
 import FirebaseLogin from './components/FirebaseLogin';
 import { io, Socket } from 'socket.io-client';
 import { QRCodeCanvas } from 'qrcode.react';
@@ -817,6 +817,7 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem('github_user') || 'null'); } catch (e) { return null; }
   });
   const [isGithubDialogOpen, setIsGithubDialogOpen] = useState(false);
+  const [githubDialogMode, setGithubDialogMode] = useState<'import' | 'export'>('export');
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
   const [githubRepos, setGithubRepos] = useState<any[]>([]);
   const [isLoadingRepos, setIsLoadingRepos] = useState(false);
@@ -824,6 +825,7 @@ export default function App() {
   const [repoDescription, setRepoDescription] = useState('');
   const [showNewRepoForm, setShowNewRepoForm] = useState(false);
   const [isPrivateRepo, setIsPrivateRepo] = useState(false);
+  const [hasUnpushedEdits, setHasUnpushedEdits] = useState(false);
   const isGeneratingLocallyRef = useRef(false);
   const currentProjectIdRef = useRef<string | null>(null);
 
@@ -842,7 +844,11 @@ export default function App() {
       if (isGeneratingLocallyRef.current) return; // We are producing the stream locally
       setIsLoading(true);
       setAgentStatus('typing');
-      setStreamingMessage(message.data.fullText);
+      if (message.data.fullText) {
+        setStreamingMessage(message.data.fullText);
+      } else if (message.data.text) {
+        setStreamingMessage(prev => (prev || '') + message.data.text);
+      }
     };
 
     const onStreamComplete = (message: any) => {
@@ -905,10 +911,24 @@ export default function App() {
   const handleGithubConnect = async () => {
     try {
       const res = await fetch('/api/auth/github/url');
-      const { url } = await res.json();
-      window.open(url, 'github_oauth', 'width=600,height=700');
-    } catch (err) {
+      const data = await res.json();
+      
+      if (data.error) {
+        setMessages(prev => [...prev, { 
+          role: 'system', 
+          content: `❌ **Configuración Requerida**: ${data.error}. Por favor, configura \`GITHUB_CLIENT_ID\` y \`GITHUB_CLIENT_SECRET\` en los Secretos de AI Studio.` 
+        }]);
+        return;
+      }
+      
+      if (!data.url) {
+        throw new Error('No se pudo generar la URL de autenticación de GitHub.');
+      }
+
+      window.open(data.url, 'github_oauth', 'width=600,height=700');
+    } catch (err: any) {
       console.error('Failed to get GitHub auth URL:', err);
+      setMessages(prev => [...prev, { role: 'system', content: `❌ Error al conectar con GitHub: ${err.message}` }]);
     }
   };
 
@@ -959,11 +979,45 @@ export default function App() {
       if (data.success) {
         setMessages(prev => [...prev, { role: 'system', content: `🚀 Proyecto exportado exitosamente a **${repoFullName}**.` }]);
         setIsGithubDialogOpen(false);
+        setHasUnpushedEdits(false);
+        if (currentProject) {
+          const updated = { ...currentProject, githubRepo: repoFullName };
+          setCurrentProject(updated);
+          setProjects(prev => prev.map(p => p.id === updated.id ? updated : p));
+        }
       } else {
         throw new Error(data.error || 'Failed to export');
       }
     } catch (err: any) {
       setMessages(prev => [...prev, { role: 'system', content: `❌ Error al exportar: ${err.message}` }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const importFromGithub = async (repoFullName: string) => {
+    if (!githubToken) return;
+    setIsLoading(true);
+    try {
+      const res = await fetch('/api/github/import', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `token ${githubToken}`
+        },
+        body: JSON.stringify({ repoFullName })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setProjects(prev => [data.project, ...prev]);
+        setMessages(prev => [...prev, { role: 'system', content: `✅ Proyecto **${repoFullName}** importado exitosamente.` }]);
+        loadProject(data.project);
+        setIsGithubDialogOpen(false);
+      } else {
+        throw new Error(data.error || 'Failed to import');
+      }
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'system', content: `❌ Error al importar: ${err.message}` }]);
     } finally {
       setIsLoading(false);
     }
@@ -1059,15 +1113,81 @@ export default function App() {
 
   // Fetch projects
   useEffect(() => {
+    let isMounted = true;
     if (view === 'dashboard') {
-      fetch('/api/projects')
-        .then(res => res.json())
-        .then(data => {
-          if (data.success) setProjects(data.projects);
-        })
-        .catch(console.error);
+      const loadAllProjects = async () => {
+        const idSet = new Set<string>();
+        let allProjects = [];
+
+        // 1. Try local storage first to recover ephemeral container projects
+        try {
+          const localProjectsStr = localStorage.getItem('aura_projects');
+          if (localProjectsStr) {
+            const parsed = JSON.parse(localProjectsStr);
+            if (Array.isArray(parsed)) {
+              parsed.forEach(p => {
+                if (!idSet.has(p.id)) {
+                  idSet.add(p.id);
+                  allProjects.push(p);
+                }
+              });
+            }
+          }
+        } catch (e) {}
+
+        // 2. Try Node API
+        try {
+          const res = await fetch('/api/projects');
+          const data = await res.json();
+          if (data.success && Array.isArray(data.projects)) {
+            data.projects.forEach(p => {
+              if (!idSet.has(p.id)) {
+                idSet.add(p.id);
+                allProjects.push(p);
+              } else {
+                // merge updated metadata
+                const idx = allProjects.findIndex(ap => ap.id === p.id);
+                if (idx !== -1) allProjects[idx] = p;
+              }
+            });
+          }
+        } catch (err) {
+          console.error(err);
+        }
+
+        // 3. Try Firebase
+        if (fbUser) {
+          try {
+            const fbProjects = await getProjectsFromFirebase();
+            fbProjects.forEach(fp => {
+              if (!idSet.has(fp.id)) {
+                idSet.add(fp.id);
+                allProjects.push(fp);
+              } else {
+                const idx = allProjects.findIndex(ap => ap.id === fp.id);
+                if (idx !== -1) allProjects[idx] = fp;
+              }
+            });
+          } catch (err) {
+            console.error('Failed to load firebase projects:', err);
+            const errString = String(err);
+            if (errString.includes('resource-exhausted') || errString.includes('Quota limit exceeded') || errString.includes('quota')) {
+              setMessages(prev => [...prev, { role: 'system', content: '❌ Firestore Quota limit exceeded for reading projects. The quota will reset tomorrow.' }]);
+            }
+          }
+        }
+
+        // Save merged list back to localStorage
+        try {
+          localStorage.setItem('aura_projects', JSON.stringify(allProjects));
+        } catch(e) {}
+
+        if (isMounted) setProjects(allProjects);
+      };
+      loadAllProjects();
     }
-  }, [view]);
+    return () => { isMounted = false; };
+  }, [view, fbUser]);
 
   const loadProject = async (project: Project) => {
     setCurrentProject(project);
@@ -1075,6 +1195,7 @@ export default function App() {
     setIsLoaded(false);
     try {
       let projectFiles: FileItem[] = [];
+      let apiMessages: Message[] = [];
 
       // Try Firebase first if logged in
       if (fbUser) {
@@ -1082,6 +1203,10 @@ export default function App() {
           projectFiles = await loadProjectFiles(project.id);
         } catch (e) {
           console.error('Failed to load from Firebase:', e);
+          const errString = String(e);
+          if (errString.includes('resource-exhausted') || errString.includes('Quota limit exceeded') || errString.includes('quota')) {
+            setMessages(prev => [...prev, { role: 'system', content: '❌ Firestore Quota limit exceeded. Your database has hit its free daily read/write limits. The quota will reset the next day. Detailed quota information can be found under the Spark plan column in the Enterprise edition section of https://firebase.google.com/pricing#cloud-firestore' }]);
+          }
         }
       }
 
@@ -1089,8 +1214,28 @@ export default function App() {
       if (projectFiles.length === 0) {
         const res = await fetch(`/api/load-files?projectId=${project.id}`);
         const data = await res.json();
-        if (data.success && data.files && data.files.length > 0) {
-          projectFiles = data.files;
+        if (data.success) {
+          if (data.files && data.files.length > 0) {
+            projectFiles = data.files;
+          }
+          if (data.messages && data.messages.length > 0) {
+            apiMessages = data.messages;
+          }
+        }
+      }
+
+      // If still empty, try localStorage
+      if (projectFiles.length === 0) {
+        const savedFilesStr = (() => {
+          try { return localStorage.getItem(`aura_files_${project.id}`); } catch (e) { return null; }
+        })();
+        if (savedFilesStr) {
+          try { 
+            const parsed = JSON.parse(savedFilesStr); 
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              projectFiles = parsed;
+            }
+          } catch (e) {}
         }
       }
 
@@ -1107,14 +1252,36 @@ export default function App() {
         setActiveFile(initial[0]);
       }
       
-      // Messages sync (local fallback for now)
-      const savedMsgsStr = (() => {
-        try { return localStorage.getItem(`aura_messages_${project.id}`); } catch (e) { return null; }
-      })();
-      let savedMsgs = [];
-      if (savedMsgsStr) {
-        try { savedMsgs = JSON.parse(savedMsgsStr); } catch (e) {}
+      // Messages sync (try firebase first, then api, then local fallback)
+      let savedMsgs: Message[] = [];
+      if (fbUser) {
+        try {
+          const fbMsgs = await loadProjectMessages(project.id);
+          if (fbMsgs && fbMsgs.length > 0) {
+            savedMsgs = fbMsgs;
+          }
+        } catch(e) {
+          console.error("Failed to load messages from Firebase", e);
+          const errString = String(e);
+          if (errString.includes('resource-exhausted') || errString.includes('Quota limit exceeded') || errString.includes('quota')) {
+            setMessages(prev => [...prev, { role: 'system', content: '❌ Firestore Quota limit exceeded for messages. Your database has hit its free daily read/write limits.' }]);
+          }
+        }
       }
+
+      if (savedMsgs.length === 0 && apiMessages.length > 0) {
+        savedMsgs = apiMessages;
+      }
+
+      if (savedMsgs.length === 0) {
+        const savedMsgsStr = (() => {
+          try { return localStorage.getItem(`aura_messages_${project.id}`); } catch (e) { return null; }
+        })();
+        if (savedMsgsStr) {
+          try { savedMsgs = JSON.parse(savedMsgsStr); } catch (e) {}
+        }
+      }
+      
       setMessages(savedMsgs.length > 0 ? savedMsgs : [{ role: 'model', content: '¡Hola! Welcome! What would you like to build today?' }]);
       
       setView('editor');
@@ -1149,6 +1316,7 @@ export default function App() {
       };
       setFiles(prev => [...prev, newFile]);
       setActiveFile(newFile);
+      setHasUnpushedEdits(true);
     }
     setIsCreatingFile(false);
     setNewItemName('');
@@ -1162,6 +1330,7 @@ export default function App() {
   const confirmRename = (oldName: string) => {
     if (newItemName && newItemName !== oldName) {
       setFiles(prev => prev.map(f => f.name === oldName ? { ...f, name: newItemName } : f));
+      setHasUnpushedEdits(true);
       if (activeFile.name === oldName) setActiveFile(prev => ({ ...prev, name: newItemName }));
     }
     setRenamingFile(null);
@@ -1283,11 +1452,52 @@ export default function App() {
     saveAs(content, 'project-aura.zip');
   };
 
-  const createProject = async (name: string, type: Project['type']) => {
+  const createProject = async (name: string, type: Project['type'], githubPrivate?: boolean) => {
     let initialFiles = INITIAL_REACT_FILES;
     if (type === 'expo') initialFiles = INITIAL_EXPO_FILES;
     else if (type === 'basic') initialFiles = INITIAL_BASIC_FILES;
     else if (type === 'fullstack') initialFiles = INITIAL_FULLSTACK_FILES;
+    
+    let githubRepoFullName = undefined;
+
+    // Create GitHub repo if requested
+    if (githubPrivate !== undefined && githubToken) {
+       try {
+         const gitRes = await fetch('/api/github/create-repo', {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `token ${githubToken}`
+            },
+            body: JSON.stringify({ name, private: githubPrivate })
+         });
+         const gitData = await gitRes.json();
+         if (gitData.full_name) {
+           githubRepoFullName = gitData.full_name;
+           
+           // We also do an initial export to GitHub
+           await fetch('/api/github/export', {
+              method: 'POST',
+              headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `token ${githubToken}`
+              },
+              body: JSON.stringify({
+                repoFullName: gitData.full_name,
+                files: initialFiles,
+                commitMessage: `Initial commit from Aura Studio`
+              })
+            });
+            setMessages(prev => [...prev, { role: 'system', content: `🚀 Repositorio creado y exportado exitosamente en GitHub: **${gitData.full_name}**.` }]);
+         } else {
+           console.error("Failed to create GitHub repo:", gitData);
+           setMessages(prev => [...prev, { role: 'system', content: `❌ Error al crear repositorio en GitHub: ${gitData.error || 'Desconocido'}` }]);
+         }
+       } catch (err) {
+         console.error('Error in github repo creation:', err);
+       }
+    }
+
     try {
       const res = await fetch('/api/projects', {
         method: 'POST',
@@ -1296,6 +1506,14 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
+        if (githubRepoFullName) {
+           data.project.githubRepo = githubRepoFullName;
+           await fetch('/api/save-files', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectId: data.project.id, files: initialFiles })
+           }); // Ensure meta is updated
+        }
         loadProject(data.project);
       }
     } catch (err) {
@@ -1314,6 +1532,7 @@ export default function App() {
         if (fbUser) {
           await saveProjectMetadata(currentProject);
           await syncProjectFiles(currentProject.id, files);
+          await syncProjectMessages(currentProject.id, messages);
         }
 
         // Fallback to localStorage - Skip if project > 5MB to avoid crash and disk full
@@ -1323,6 +1542,14 @@ export default function App() {
             const messagesJson = JSON.stringify(messages);
             localStorage.setItem(`aura_messages_${currentProject.id}`, messagesJson);
             localStorage.setItem(`aura_files_${currentProject.id}`, filesJson);
+            
+            const prevProjectsStr = localStorage.getItem('aura_projects');
+            let prevProjects = [];
+            if (prevProjectsStr) prevProjects = JSON.parse(prevProjectsStr);
+            const existsIdx = prevProjects.findIndex((p: any) => p.id === currentProject.id);
+            if (existsIdx >= 0) prevProjects[existsIdx] = currentProject;
+            else prevProjects.push(currentProject);
+            localStorage.setItem('aura_projects', JSON.stringify(prevProjects));
           } catch (e) {
             // ignore localStorage full/blocked errors
           }
@@ -1362,6 +1589,14 @@ export default function App() {
         });
       } catch (err) {
         console.error('Failed to sync data:', err);
+        const errString = String(err);
+        if (errString.includes('resource-exhausted') || errString.includes('Quota limit exceeded') || errString.includes('quota')) {
+           setMessages(prev => {
+              const alreadyWarned = prev.some(m => m.content.includes('Quota limit exceeded'));
+              if (alreadyWarned) return prev;
+              return [...prev, { role: 'system', content: '❌ Firestore Quota limit exceeded. Your database has hit its free daily write limits. The quota will reset the next day. Detailed quota information can be found under the Spark plan column in the Enterprise edition section of https://firebase.google.com/pricing#cloud-firestore' }];
+           });
+        }
       }
     };
     
@@ -1376,15 +1611,22 @@ export default function App() {
     if (!value) return;
     setFiles(prev => prev.map(f => f.name === activeFile.name ? { ...f, content: value } : f));
     setActiveFile(prev => ({ ...prev, content: value }));
+    setHasUnpushedEdits(true);
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Reject images larger than 300MB
-    if (file.size > 300 * 1024 * 1024) {
-      setMessages(prev => [...prev, { role: 'system', content: `❌ La imagen es demasiado grande (${(file.size / 1024 / 1024).toFixed(1)}MB). El máximo es 300MB.` }]);
+    // Reject images larger than 10MB to be safe with inline base64 limits for Gemini
+    if (file.size > 10 * 1024 * 1024) {
+      setMessages(prev => [...prev, { role: 'system', content: `❌ La imagen es demasiado grande (${(file.size / 1024 / 1024).toFixed(1)}MB). El máximo es 10MB.` }]);
+      return;
+    }
+
+    const validMimes = ['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif'];
+    if (!validMimes.includes(file.type)) {
+      setMessages(prev => [...prev, { role: 'system', content: `❌ Formato de imagen no soportado. Formatos válidos: PNG, JPEG, WEBP, HEIC, HEIF.` }]);
       return;
     }
 
@@ -1418,7 +1660,12 @@ export default function App() {
       if (currentProjectIdRef.current === startingProjectId) setMessages(currentMessages);
       
       const channel = ably.channels.get(`project-${currentProject?.id || 'default'}-chat`);
-      channel.publish('new_message', { message: userMessage, sender: ably.auth.clientId });
+      const msgForAbly = { ...userMessage };
+      if (msgForAbly.image) {
+        msgForAbly.image = { data: '', mimeType: msgForAbly.image.mimeType }; // Strip base64 to avoid 64KB Ably limit
+        msgForAbly.content = msgForAbly.content + '\n*[Imagen adjuntada]*';
+      }
+      channel.publish('new_message', { message: msgForAbly, sender: ably.auth.clientId });
 
       setInput('');
       setSelectedImage(null);
@@ -1454,6 +1701,7 @@ export default function App() {
             hasFunctionCall = true;
             for (const call of chunk.functionCalls) {
               if (call.name === 'write_file') {
+                setHasUnpushedEdits(true);
                 const { name, content, language } = call.args as any;
                 setFiles(prev => {
                   const exists = prev.find(f => f.name === name);
@@ -1544,7 +1792,7 @@ export default function App() {
             
             // Ably token streaming integration
             const channel = ably.channels.get(`project-${currentProject?.id || 'default'}-chat`);
-            channel.publish('token_stream', { text: chunk.text, fullText });
+            channel.publish('token_stream', { text: chunk.text });
           }
         }
 
@@ -1597,40 +1845,14 @@ export default function App() {
           return;
         }
 
-        // Auto-verification logic runs when finally done (isFinished)
+        // Auto-verification logic removed - request the final summary directly
         if (isFinished && !skipVerification) {
           isContinuing = true;
-          setAgentStatus('verifying');
-          
-          try {
-            const res = await fetch('/api/run-command', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ command: 'npm run lint', projectId: currentProject?.id })
-            });
-            const data = await res.json();
-            
-            if (!data.success) {
-              // Errors found!
-              setAgentStatus('thinking');
-              const errorPrompt = `He detectado errores después de los cambios. Por favor, corrígelos:\n\n\`\`\`\n${data.output}\n\`\`\``;
-              // Reset retry count when fixing errors to give it more attempts. We WANT to verify after fixing.
-              setTimeout(() => handleSendMessage(errorPrompt, 0, finalMessages, true, false), 3000);
-              return; 
-            } else {
-              // Success! No errors. We request the final summary.
-              setAgentStatus('thinking');
-              setStreamingMessage('Generando resumen final para el usuario...');
-              const summaryPrompt = "Dile al usuario la edición que hiciste de forma clara y amigable. Resume los problemas solucionados o los archivos creados/editados.";
-              
-              // Call summary. Here we set skipVerification to true so it stops instead of triggering this block again!
-              setTimeout(() => handleSendMessage(summaryPrompt, 0, finalMessages, true, true), 1500);
-              return;
-            }
-          } catch (e) {
-            console.error('Verification failed:', e);
-            isContinuing = false; // Need to reset if it fails
-          }
+          setAgentStatus('thinking');
+          setStreamingMessage('Generando resumen final para el usuario...');
+          const summaryPrompt = "Dile al usuario la edición que hiciste de forma clara y amigable. Resume los problemas solucionados o los archivos creados/editados.";
+          setTimeout(() => handleSendMessage(summaryPrompt, 0, finalMessages, true, true), 1500);
+          return;
         }
 
       } catch (error: any) {
@@ -1638,11 +1860,13 @@ export default function App() {
         let errorMessage = error.message || String(error);
         
         if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
-          errorMessage = "⚠️ Límite de cuota alcanzado. Por favor, espera un minuto antes de intentarlo de nuevo o revisa tu plan en Google AI Studio.";
+          errorMessage = "⚠️ Límite de cuota alcanzado. Por favor, espera un minuto antes de intentarlo de nuevo o cambia a un modelo diferente (como Economy/Flash) en los ajustes.";
         } else if (errorMessage.includes('quota')) {
           errorMessage = "⚠️ Se ha excedido la cuota de la API. Inténtalo de nuevo en unos instantes.";
         } else if (errorMessage.includes('403') || errorMessage.includes('PERMISSION_DENIED') || errorMessage.includes('permission')) {
           errorMessage = "🚫 Acceso denegado (403). Es posible que la clave de API empleada no tenga permisos para usar este modelo en concreto (algunos modelos experimentales requieren acceso anticipado) o tu región no esté soportada. Intenta seleccionar un modelo diferente (como Economy/Flash).";
+        } else if (errorMessage.includes('404') || errorMessage.includes('NOT_FOUND')) {
+          errorMessage = "🔍 Recurso no encontrado (404). Asegúrate de que el modelo seleccionado sea válido y esté disponible. Si has cambiado el modelo recientemente, intenta recargar la página.";
         }
 
         if (currentProjectIdRef.current === startingProjectId) setMessages(prev => [...prev, { role: 'system', content: `Error al comunicar con Aura: ${errorMessage}` }]);
@@ -1660,6 +1884,7 @@ export default function App() {
     if (files.length <= 1) return;
     const newFiles = files.filter(f => f.name !== name);
     setFiles(newFiles);
+    setHasUnpushedEdits(true);
     if (activeFile.name === name) {
       setActiveFile(newFiles[0]);
     }
@@ -1891,10 +2116,15 @@ export default function App() {
 
           const modules = {};
           async function customRequire(name) {
-            if (name === 'react') return window.React;
-            if (name === 'react-dom') return window.ReactDOM;
-            if (name === 'react-dom/client') return window.ReactDOMClient;
-            if (name === 'lucide-react') return window.lucide;
+            if (name === 'react') return { ...window.React, default: window.React.default || window.React, __esModule: true };
+            if (name === 'react-dom') return { ...window.ReactDOM, default: window.ReactDOM.default || window.ReactDOM, __esModule: true };
+            if (name === 'react-dom/client') {
+                const client = typeof window.ReactDOMClient !== 'undefined' ? window.ReactDOMClient : (window.ReactDOM || {});
+                const createRootFn = client.createRoot || client.default?.createRoot || window.ReactDOM?.createRoot;
+                const defaultObj = Object.assign({}, client.default || client || window.ReactDOM, { createRoot: createRootFn });
+                return { ...client, createRoot: createRootFn, default: defaultObj, __esModule: true };
+            }
+            if (name === 'lucide-react') return { ...window.lucide, default: window.lucide, __esModule: true };
             if (name.endsWith('.css')) return {}; 
 
             let baseName = name.replace(/^\\.\\//, '').replace(/\\.jsx?$/, '').replace(/\\.tsx?$/, '');
@@ -1949,7 +2179,8 @@ export default function App() {
                let appFile = files.find(f => f.name === 'App.tsx' || f.name === 'src/App.tsx' || f.name === 'App.js' || f.name === 'src/App.js');
                if (appFile) {
                   const App = await customRequire(appFile.name);
-                  const root = window.ReactDOMClient.createRoot(document.getElementById('root'));
+                  const createRootFn = window.ReactDOMClient?.createRoot || window.ReactDOMClient?.default?.createRoot || window.ReactDOM?.createRoot;
+                  const root = createRootFn(document.getElementById('root'));
                   root.render(React.createElement(App.default || App));
                } else {
                   document.getElementById('root').innerHTML = '<div style="padding: 20px; color: #666; font-family: sans-serif; text-align: center;"><h3>Error de Inicio</h3><p>No se encontró main.tsx o App.tsx</p></div>';
@@ -2429,7 +2660,19 @@ export default function App() {
   };
 
   if (view === 'dashboard') {
-    return <Dashboard projects={projects} onCreateProject={createProject} onLoadProject={loadProject} />;
+    return (
+      <Dashboard 
+        projects={projects} 
+        onCreateProject={createProject} 
+        onLoadProject={loadProject} 
+        githubUser={githubUser}
+        onImportFromGithub={() => {
+          setGithubDialogMode('import');
+          setIsGithubDialogOpen(true);
+          if (githubToken) fetchGithubRepos();
+        }}
+      />
+    );
   }
 
   return (
@@ -2515,6 +2758,18 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-1 md:gap-2">
+              {currentProject?.githubRepo && githubToken && (
+                <Button 
+                  variant={hasUnpushedEdits ? "default" : "outline"} 
+                  size="sm" 
+                  className={cn("hidden lg:flex h-8 md:h-9 px-3 transition-all", hasUnpushedEdits ? "bg-indigo-600 hover:bg-indigo-700 text-white border-transparent" : "bg-white text-zinc-700 border-zinc-200")}
+                  onClick={() => exportToGithub(currentProject.githubRepo!)}
+                  disabled={isLoading}
+                >
+                  {isLoading ? <Loader2 className="w-3.5 h-3.5 mr-2 md:mr-2 animate-spin" /> : <Github className="w-3.5 h-3.5 md:w-4 md:h-4 md:mr-2" />}
+                  <span className="hidden xl:inline">{hasUnpushedEdits ? 'Actualizar código' : 'Sincronizado'}</span>
+                </Button>
+              )}
               <Tooltip>
                 <TooltipTrigger 
                   render={
@@ -2638,18 +2893,32 @@ export default function App() {
                   Download ZIP
                 </Button>
                 {githubToken ? (
-                  <Button 
-                    variant="outline" 
-                    size="sm" 
-                    className="w-full h-9 gap-2 text-[10px] border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 shadow-none"
-                    onClick={() => {
-                      setIsGithubDialogOpen(true);
-                      fetchGithubRepos();
-                    }}
-                  >
-                    <Github className="w-4 h-4" />
-                    Export to GitHub
-                  </Button>
+                  currentProject?.githubRepo ? (
+                    <Button 
+                      variant={hasUnpushedEdits ? "default" : "outline"} 
+                      size="sm" 
+                      className={cn("w-full h-9 gap-2 text-[10px] shadow-none", hasUnpushedEdits ? "bg-indigo-600 hover:bg-indigo-700 text-white" : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50")}
+                      onClick={() => exportToGithub(currentProject.githubRepo!)}
+                      disabled={isLoading}
+                    >
+                      {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Github className="w-4 h-4" />}
+                      Actualizar código
+                    </Button>
+                  ) : (
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      className="w-full h-9 gap-2 text-[10px] border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 shadow-none"
+                      onClick={() => {
+                        setGithubDialogMode('export');
+                        setIsGithubDialogOpen(true);
+                        fetchGithubRepos();
+                      }}
+                    >
+                      <Github className="w-4 h-4" />
+                      Export to GitHub
+                    </Button>
+                  )
                 ) : (
                   <Button 
                     variant="outline" 
@@ -3301,8 +3570,12 @@ export default function App() {
                       <Github className="w-5 h-5 text-white" />
                     </div>
                     <div>
-                      <h2 className="text-xl font-bold text-zinc-900 tracking-tight">Export to GitHub</h2>
-                      <p className="text-xs text-zinc-500 font-medium">Sync your project with a repository</p>
+                      <h2 className="text-xl font-bold text-zinc-900 tracking-tight">
+                        {githubDialogMode === 'import' ? 'Import from GitHub' : 'Export to GitHub'}
+                      </h2>
+                      <p className="text-xs text-zinc-500 font-medium">
+                        {githubDialogMode === 'import' ? 'Select a repository to import' : 'Sync your project with a repository'}
+                      </p>
                     </div>
                   </div>
                   <Button variant="ghost" size="icon" onClick={() => setIsGithubDialogOpen(false)} className="rounded-full hover:bg-zinc-200">
@@ -3311,7 +3584,24 @@ export default function App() {
                 </div>
 
                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                  {showNewRepoForm ? (
+                  {!githubToken ? (
+                    <div className="flex flex-col items-center justify-center py-12 text-center space-y-4">
+                      <div className="w-16 h-16 bg-zinc-100 rounded-2xl flex items-center justify-center mb-2">
+                        <Github className="w-8 h-8 text-zinc-400" />
+                      </div>
+                      <div className="space-y-1">
+                        <h3 className="text-lg font-bold text-zinc-900">GitHub no conectado</h3>
+                        <p className="text-sm text-zinc-500 max-w-[280px]">Conecta tu cuenta de GitHub para importar o exportar tus proyectos.</p>
+                      </div>
+                      <Button 
+                        onClick={handleGithubConnect}
+                        className="bg-black hover:bg-zinc-800 text-white px-8 rounded-xl h-11 font-bold shadow-lg flex items-center gap-2"
+                      >
+                        <Github className="w-4 h-4" />
+                        Conectar GitHub
+                      </Button>
+                    </div>
+                  ) : showNewRepoForm ? (
                     <div className="space-y-4 animate-in fade-in slide-in-from-right-4 duration-300">
                       <div className="space-y-1.5">
                         <label className="text-[10px] uppercase tracking-widest font-bold text-zinc-400 px-1">Repository Name</label>
@@ -3381,14 +3671,16 @@ export default function App() {
                     <div className="space-y-4 animate-in fade-in slide-in-from-left-4 duration-300">
                       <div className="flex items-center justify-between px-1">
                         <label className="text-[10px] uppercase tracking-widest font-bold text-zinc-400">Your Repositories</label>
-                        <Button 
-                          variant="ghost" 
-                          size="sm" 
-                          className="h-7 text-xs text-indigo-600 font-bold hover:text-indigo-700 hover:bg-indigo-50 px-2 rounded-lg"
-                          onClick={() => setShowNewRepoForm(true)}
-                        >
-                          <Plus className="w-3.5 h-3.5 mr-1" /> New Repo
-                        </Button>
+                        {githubDialogMode === 'export' && (
+                          <Button 
+                            variant="ghost" 
+                            size="sm" 
+                            className="h-7 text-xs text-indigo-600 font-bold hover:text-indigo-700 hover:bg-indigo-50 px-2 rounded-lg"
+                            onClick={() => setShowNewRepoForm(true)}
+                          >
+                            <Plus className="w-3.5 h-3.5 mr-1" /> New Repo
+                          </Button>
+                        )}
                       </div>
                       
                       {isLoadingRepos ? (
@@ -3402,7 +3694,10 @@ export default function App() {
                             <button 
                               key={repo.id}
                               disabled={isLoading}
-                              onClick={() => exportToGithub(repo.full_name)}
+                              onClick={() => {
+                                if (githubDialogMode === 'import') importFromGithub(repo.full_name);
+                                else exportToGithub(repo.full_name);
+                              }}
                               className="group w-full flex items-center justify-between p-4 rounded-2xl border border-zinc-100 bg-zinc-50/30 hover:bg-white hover:border-indigo-200 hover:shadow-md transition-all text-left"
                             >
                               <div className="flex items-center gap-3 overflow-hidden">
